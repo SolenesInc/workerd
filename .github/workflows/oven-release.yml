@@ -11,6 +11,10 @@ permissions:
   contents: read
   packages: write
 
+# One release of a tag at a time, so two runs never race to publish it.
+concurrency:
+  group: oven-release-${{ github.ref }}
+
 jobs:
   release:
     runs-on: ubuntu-24.04
