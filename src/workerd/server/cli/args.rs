@@ -421,6 +421,22 @@ pub struct ServeArgs {
     /// development only.
     #[arg(long, value_name = "addr")]
     pub debug_port: Option<String>,
+
+    /// Oven: store a wrangler config's Durable Objects under <dir>, one directory per class
+    /// named by the class's storage key (its name, unless it was renamed), instead of
+    /// `.wrangler/state/workerd` beside the config.
+    #[arg(long = "oven-objects-dir", value_name = "dir")]
+    pub oven_objects_dir: Option<String>,
+
+    /// Oven: give a wrangler config's worker each environment variable of this process as a text
+    /// binding, over the config's `vars`.
+    #[arg(long = "oven-env")]
+    pub oven_env: bool,
+
+    /// Oven: serve the admin socket on <addr>: `POST /objects/<class>/<id>/sql` runs a statement
+    /// inside a live Durable Object. It has no authentication; only oven's data pod may reach it.
+    #[arg(long = "oven-admin-addr", value_name = "addr")]
+    pub oven_admin_addr: Option<String>,
 }
 
 #[derive(Args, Debug)]

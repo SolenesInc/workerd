@@ -476,6 +476,7 @@ impl ActorNamespace {
             self.factory.raw(),
             path,
             unique_key,
+            &self.class_name,
             Box::new(ActorNamespaceHandle(Weak::clone(&self.this))),
         )?;
         if self.cluster().is_some() {
@@ -486,6 +487,28 @@ impl ActorNamespace {
         // Checked above; nothing else sets it.
         let _ = self.storage.set(storage);
         Ok(())
+    }
+
+    /// Oven's admin socket: a request on the object whose 64-hex id is `id`, if its file
+    /// exists. A request never creates an object, so an id with no file is `None`, as is any
+    /// id of a namespace not stored on disk or stored in a cluster.
+    pub fn existing_object(&self, id: &str) -> Result<Option<KjOwn<WorkerInterface>>> {
+        let Some(directory) = self.directory.get() else {
+            return Ok(None);
+        };
+        let hex = id.len() == 64 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        if !hex || self.cluster().is_some() {
+            return Ok(None);
+        }
+        if !std::path::Path::new(directory)
+            .join(format!("{id}.sqlite"))
+            .is_file()
+        {
+            return Ok(None);
+        }
+        let metadata = ffi::new_request_metadata(KjMaybe::None, KjMaybe::None);
+        let container = self.container_for(ffi::actor_id_from_hex(id)?);
+        Ok(Some(container.start_request(metadata)?))
     }
 
     /// The `uniqueKey` of a durable namespace; none for an ephemeral one.

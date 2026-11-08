@@ -76,6 +76,44 @@ void AlarmScheduler::ensureInitialized(SqliteDatabase& db) {
   if (!hasNameColumn) {
     db.run("ALTER TABLE _cf_ALARM ADD COLUMN actor_name TEXT;");
   }
+
+  db.run(R"(
+    CREATE TABLE IF NOT EXISTS _oven_OBJECT (
+      actor_id TEXT PRIMARY KEY,
+      name TEXT,
+      created_at INTEGER,
+      last_alarm_at INTEGER,
+      last_alarm_ok INTEGER,
+      last_alarm_retries INTEGER
+    );
+  )");
+  db.run(R"(
+    CREATE TABLE IF NOT EXISTS _oven_NAMESPACE (class_name TEXT PRIMARY KEY);
+  )");
+}
+
+namespace {
+int64_t unixMillis(const kj::Clock& clock) {
+  return (clock.now() - kj::UNIX_EPOCH) / kj::MILLISECONDS;
+}
+}  // namespace
+
+void AlarmScheduler::registerObject(const ActorKey& actor) {
+  SqliteDatabase::Query::ValuePtr nameParam = nullptr;
+  KJ_IF_SOME(n, actor.name) {
+    nameParam = n.asPtr();
+  }
+  stmtRegisterObject.run(actor.actorId, nameParam, unixMillis(clock));
+}
+
+void AlarmScheduler::setClassName(kj::StringPtr className) {
+  db->run("DELETE FROM _oven_NAMESPACE;");
+  db->run("INSERT INTO _oven_NAMESPACE VALUES(?);", className);
+}
+
+void AlarmScheduler::recordAlarm(const ActorKey& actor, bool ok, uint32_t retries) {
+  stmtRecordAlarm.run(
+      unixMillis(clock), static_cast<int64_t>(ok), static_cast<int64_t>(retries), actor.actorId);
 }
 
 void AlarmScheduler::loadAlarmsFromDb() {
@@ -228,6 +266,8 @@ kj::Promise<void> AlarmScheduler::makeAlarmTask(
     // We can't overwrite our entry before moving ourselves out of it, as a promise cannot
     // delete itself.
     tasks.add(kj::mv(entry.value.task));
+
+    recordAlarm(ownActor, alarmOutcome.outcome == EventOutcome::OK, entry.value.retry);
 
     // If an alarm is queued, there's no point in retrying the current one -- proceed
     // to running the queued alarm instead.

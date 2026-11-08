@@ -16,6 +16,11 @@
 //! directory per class, named `<name>-<key>` by its storage key (see [`do_classes`]). The server
 //! listens on `localhost:8787`, as `wrangler dev` does; `--socket-addr http=<addr>` overrides it.
 //!
+//! Oven's options ([`ServeOptions`]) change two things for `workerd serve`. `--oven-objects-dir`
+//! stores the objects under the given directory instead, one directory per class named by its
+//! storage key alone, so that renaming the worker keeps its objects. `--oven-env` gives the worker
+//! each environment variable of the process as a text binding, over `vars`.
+//!
 //! For `workerd deploy`, [`load_deployment`] translates the same fields into a cluster deployment
 //! (`cluster::compose`), which holds only services: the worker, named after the deployment, with
 //! no socket, and its Durable Objects stored on the disk service [`DEPLOYMENT_STORAGE`], which
@@ -177,19 +182,29 @@ pub fn project_config(dir: &Path) -> Result<PathBuf, String> {
     ))
 }
 
+/// Oven's choices for `workerd serve` of a wrangler config. The default is `wrangler dev`'s.
+#[derive(Default)]
+pub struct ServeOptions {
+    /// `--oven-objects-dir`: where the Durable Objects are stored.
+    pub objects_dir: Option<PathBuf>,
+    /// `--oven-env`: the process's environment variables become text bindings.
+    pub env: bool,
+}
+
 /// What a wrangler config is translated into.
 enum Target<'a> {
     /// A config to serve: the worker named after the config's `name`, else `main`, a socket, and
-    /// a disk service for its Durable Objects under `.wrangler/state/workerd`.
-    Serve,
+    /// a disk service for its Durable Objects under `.wrangler/state/workerd`, unless `options`
+    /// says otherwise.
+    Serve(&'a ServeOptions),
     /// A cluster deployment, services only: the worker named `name`, else after the config's
     /// `name`, and its Durable Objects stored on the node's [`DEPLOYMENT_STORAGE`].
     Deployment { name: Option<&'a str> },
 }
 
 /// The config `workerd serve` runs for the wrangler config at `path`.
-pub fn load(path: &str, process: &Process) -> Result<Config, String> {
-    translate(path, process, &Target::Serve).map(|(_, config)| config)
+pub fn load(path: &str, process: &Process, options: &ServeOptions) -> Result<Config, String> {
+    translate(path, process, &Target::Serve(options)).map(|(_, config)| config)
 }
 
 /// The deployment `workerd deploy` publishes for the wrangler config at `path`, and its name:
@@ -216,7 +231,7 @@ fn translate(path: &str, process: &Process, target: &Target) -> Result<(String, 
     let root = file.parent().unwrap_or(&file);
 
     let name = match target {
-        Target::Serve => wrangler.name.clone().unwrap_or_else(|| "main".to_owned()),
+        Target::Serve(_) => wrangler.name.clone().unwrap_or_else(|| "main".to_owned()),
         Target::Deployment { name } => name
             .map(str::to_owned)
             .or_else(|| wrangler.name.clone())
@@ -232,8 +247,18 @@ fn translate(path: &str, process: &Process, target: &Target) -> Result<(String, 
         bundle(&esbuild(root), root, &wrangler.main, &watch)?
     };
 
-    let serving = matches!(target, Target::Serve);
-    let storage = root.join(".wrangler/state/workerd");
+    let options = match target {
+        Target::Serve(options) => Some(*options),
+        Target::Deployment { .. } => None,
+    };
+    let serving = options.is_some();
+    let objects_dir = options.and_then(|o| o.objects_dir.as_deref());
+    let storage = objects_dir.map_or_else(|| root.join(".wrangler/state/workerd"), Path::to_owned);
+    let env = if options.is_some_and(|o| o.env) {
+        process_env(&wrangler)?
+    } else {
+        Vec::new()
+    };
     if serving && !classes.is_empty() {
         fs::create_dir_all(&storage).map_err(|e| format!("{}: {e}", storage.display()))?;
     }
@@ -253,7 +278,7 @@ fn translate(path: &str, process: &Process, target: &Target) -> Result<(String, 
         .map_err(|e| e.to_string())?;
 
     set_modules(worker.reborrow(), &sources)?;
-    set_bindings(worker.reborrow(), &wrangler);
+    set_bindings(worker.reborrow(), &wrangler, &env);
 
     if !classes.is_empty() {
         let mut ns = worker
@@ -262,7 +287,11 @@ fn translate(path: &str, process: &Process, target: &Target) -> Result<(String, 
         for (i, (class, key, sql)) in classes.iter().enumerate() {
             let mut n = ns.reborrow().get(i as u32);
             n.set_class_name(class);
-            n.set_unique_key(format!("{name}-{key}"));
+            if objects_dir.is_some() {
+                n.set_unique_key(key);
+            } else {
+                n.set_unique_key(format!("{name}-{key}"));
+            }
             n.set_enable_sql(*sql);
         }
         if serving {
@@ -319,14 +348,54 @@ fn set_modules(
     Ok(())
 }
 
-/// The worker's bindings: `vars`, then the Durable Object bindings.
-fn set_bindings(worker: workerd_capnp::worker::Builder<'_>, wrangler: &Wrangler) {
-    let do_bindings = wrangler
+/// The process's environment variables, for `--oven-env`, sorted by name. One named like a
+/// Durable Object binding is an error, since it would hide the binding.
+fn process_env(wrangler: &Wrangler) -> Result<Vec<(String, String)>, String> {
+    let mut env = Vec::new();
+    for (name, value) in std::env::vars_os() {
+        let (Some(name), Some(value)) = (name.to_str(), value.to_str()) else {
+            return Err(format!(
+                "--oven-env: the environment variable {} is not UTF-8",
+                name.to_string_lossy()
+            ));
+        };
+        if do_bindings(wrangler).iter().any(|d| d.name == name) {
+            return Err(format!(
+                "--oven-env: the environment variable {name} has the name of a Durable Object \
+                 binding; rename one of them"
+            ));
+        }
+        env.push((name.to_owned(), value.to_owned()));
+    }
+    env.sort();
+    Ok(env)
+}
+
+fn do_bindings(wrangler: &Wrangler) -> &[DurableObjectBinding] {
+    wrangler
         .durable_objects
         .as_ref()
-        .map_or(&[][..], |d| &d.bindings);
-    let mut bs = worker.init_bindings((wrangler.vars.len() + do_bindings.len()) as u32);
-    for (i, (k, v)) in wrangler.vars.iter().enumerate() {
+        .map_or(&[][..], |d| &d.bindings)
+}
+
+/// The worker's bindings: `vars`, each overridden by the `env` entry of its name, plus the rest
+/// of `env` as text, then the Durable Object bindings.
+fn set_bindings(
+    worker: workerd_capnp::worker::Builder<'_>,
+    wrangler: &Wrangler,
+    env: &[(String, String)],
+) {
+    let mut values: BTreeMap<&str, Value> = wrangler
+        .vars
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.clone()))
+        .collect();
+    for (k, v) in env {
+        values.insert(k, Value::String(v.clone()));
+    }
+    let do_bindings = do_bindings(wrangler);
+    let mut bs = worker.init_bindings((values.len() + do_bindings.len()) as u32);
+    for (i, (k, v)) in values.iter().enumerate() {
         let mut b = bs.reborrow().get(i as u32);
         b.set_name(k);
         match v {
@@ -335,7 +404,7 @@ fn set_bindings(worker: workerd_capnp::worker::Builder<'_>, wrangler: &Wrangler)
         }
     }
     for (i, d) in do_bindings.iter().enumerate() {
-        let mut b = bs.reborrow().get((wrangler.vars.len() + i) as u32);
+        let mut b = bs.reborrow().get((values.len() + i) as u32);
         b.set_name(&d.name);
         b.init_durable_object_namespace()
             .set_class_name(&d.class_name);

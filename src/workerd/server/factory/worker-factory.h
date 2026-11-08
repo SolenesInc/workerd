@@ -226,6 +226,10 @@ kj::Own<WorkerInterface> worker_interface_attach(
     kj::Own<WorkerInterface> inner, ::rust::Box<KeepAlive> keep);
 kj::Promise<::rust::Vec<uint64_t>> worker_bench(
     kj::Own<WorkerInterface> worker, ::rust::Slice<const uint64_t> params);
+// Oven's admin socket: runs `query` inside the actor `worker` is a request on, through its
+// `ctx.storage.sql`, and returns the rows as a JSON array. A statement SQLite or the SQL API's
+// restrictions refuse fails with a `jsg.Error:` exception.
+kj::Promise<::rust::String> actor_oven_sql(kj::Own<WorkerInterface> worker, ::rust::Str query);
 kj::Own<ActorHandle> worker_new_actor(const CompiledWorker& worker,
     ::rust::Str className,
     kj::Maybe<kj::Own<Frankenvalue>> props,
@@ -296,6 +300,7 @@ class ActorStorage final {
 kj::Own<ActorStorage> factory_new_actor_storage(const WorkerFactory& factory,
     ::rust::Str path,
     ::rust::Str uniqueKey,
+    ::rust::Str className,
     ::rust::Box<ActorNamespaceHandle> actors);
 void actor_storage_set_alarm(
     const ActorStorage& storage, ::rust::Str actor, ::rust::Str name, uint64_t atMs);

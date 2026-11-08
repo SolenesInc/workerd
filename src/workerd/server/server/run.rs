@@ -64,6 +64,8 @@ pub struct RunOptions {
     pub control: Option<std::fs::File>,
     /// `--debug-port`.
     pub debug_port: Option<String>,
+    /// `--oven-admin-addr`: where the admin socket listens.
+    pub oven_admin: Option<String>,
     /// `--cluster-addr` and `--cluster-advertise`.
     pub cluster_address: Option<String>,
     pub cluster_advertise: Option<String>,
@@ -216,6 +218,16 @@ async fn start(
         listeners.push(Box::pin(listen::listen_debug_port(
             Rc::clone(&context),
             listener,
+        )));
+    }
+
+    if let Some(address) = &options.oven_admin {
+        let listener = listen::listen(address, 0, factory.loopback()).await?;
+        control.listen("oven-admin", listener.port()?);
+        listeners.push(Box::pin(listen::listen_oven_admin(
+            Rc::clone(&context),
+            listener,
+            Rc::clone(&server),
         )));
     }
 

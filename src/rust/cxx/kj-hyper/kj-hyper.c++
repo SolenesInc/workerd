@@ -190,6 +190,105 @@ struct WebSocketRequest {
   kj::Maybe<kj::String> offers;
 };
 
+// A server's WebSocket that closes itself with 1012 (service restart) when the server drains: a
+// WebSocket outlives its request, so it would otherwise hold the drain open for as long as its
+// client keeps it. A send in flight finishes first, as kj allows one at a time; later sends fail
+// as a disconnect, and a close of the application's own after the drain's is dropped. The client's
+// answering close completes the handshake, so the connection ends then: the application may never
+// close back (a hibernatable WebSocket's handler need not), which would leave it to the client to
+// give up.
+//
+// The drain is watched from the first receive, send or close, which run on the event loop, as
+// the watch must; every user of a WebSocket receives on it at once.
+class DrainingWebSocket final: public kj::WebSocket {
+ public:
+  DrainingWebSocket(kj::Own<kj::WebSocket> inner, ::rust::Box<Draining> draining)
+      : inner(kj::mv(inner)),
+        draining(kj::mv(draining)) {}
+
+  kj::Promise<void> send(kj::ArrayPtr<const kj::byte> message) override {
+    watch();
+    checkOpen();
+    return track(inner->send(message));
+  }
+  kj::Promise<void> send(kj::ArrayPtr<const char> message) override {
+    watch();
+    checkOpen();
+    return track(inner->send(message));
+  }
+  kj::Promise<void> close(uint16_t code, kj::StringPtr reason) override {
+    watch();
+    if (closeSent) return kj::READY_NOW;
+    closeSent = true;
+    return track(inner->close(code, reason));
+  }
+  void disconnect() override {
+    inner->disconnect();
+  }
+  void abort() override {
+    inner->abort();
+  }
+  kj::Promise<void> whenAborted() override {
+    return inner->whenAborted();
+  }
+  kj::Promise<Message> receive(size_t maxSize) override {
+    watch();
+    return inner->receive(maxSize).then([this](Message message) {
+      if (drained && closeSent && message.is<Close>()) inner->disconnect();
+      return message;
+    });
+  }
+  uint64_t sentByteCount() override {
+    return inner->sentByteCount();
+  }
+  uint64_t receivedByteCount() override {
+    return inner->receivedByteCount();
+  }
+  kj::Maybe<kj::String> getPreferredExtensions(ExtensionsContext ctx) override {
+    return inner->getPreferredExtensions(ctx);
+  }
+
+ private:
+  kj::Own<kj::WebSocket> inner;
+  ::rust::Box<Draining> draining;
+  // The send or close in flight, which the drain's close waits for.
+  kj::Maybe<kj::ForkedPromise<void>> inFlight;
+  bool drained = false;
+  bool closeSent = false;
+  kj::Maybe<kj::Promise<void>> drainTask;
+
+  void watch() {
+    if (drainTask != kj::none) return;
+    drainTask = hot(draining->wait())
+                    .then([this]() { return closeForDrain(); })
+                    // The peer may be gone already; there is nothing to tell it then.
+                    .eagerlyEvaluate([](kj::Exception&&) {});
+  }
+
+  void checkOpen() {
+    if (drained) {
+      kj::throwFatalException(KJ_EXCEPTION(DISCONNECTED, "the server is restarting"));
+    }
+  }
+
+  kj::Promise<void> track(kj::Promise<void> promise) {
+    auto forked = promise.fork();
+    auto branch = forked.addBranch();
+    inFlight = kj::mv(forked);
+    return branch;
+  }
+
+  kj::Promise<void> closeForDrain() {
+    drained = true;
+    KJ_IF_SOME(sending, inFlight) {
+      co_await sending.addBranch();
+    }
+    if (closeSent) co_return;
+    closeSent = true;
+    co_await inner->close(1012, "server restarting");
+  }
+};
+
 class ServerResponseImpl final: public kj::HttpService::Response {
  public:
   ServerResponseImpl(::rust::Box<ServerResponse> impl,
@@ -245,8 +344,9 @@ class ServerResponseImpl final: public kj::HttpService::Response {
     auto io =
         impl->accept_websocket(headers, bytes(agreement == nullptr ? ""_kj : agreement.asPtr()));
     // A server's frames are unmasked (RFC 6455 section 5.1), hence no entropy source.
-    return kj::newWebSocket(
-        kj::heap<RustIoStream>(kj::mv(io)), kj::none, kj::mv(agreed), webSocketErrors);
+    return kj::heap<DrainingWebSocket>(kj::newWebSocket(kj::heap<RustIoStream>(kj::mv(io)),
+                                           kj::none, kj::mv(agreed), webSocketErrors),
+        impl->draining());
   }
 
  private:

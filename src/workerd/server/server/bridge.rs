@@ -406,6 +406,10 @@ pub mod ffi {
         /// handler filled in, encoded, without its name. The failures of the handler's code are
         /// in the group; an error means the handler could not be run at all.
         async fn worker_bench(worker: KjOwn<WorkerInterface>, params: &[u64]) -> Result<Vec<u64>>;
+        /// Oven's admin socket: runs `query` inside the actor `worker` is a request on, through
+        /// its `ctx.storage.sql`, once the write is durable. The rows, as a JSON array. A
+        /// statement that is refused fails with a `jsg.Error:` exception.
+        async fn actor_oven_sql(worker: KjOwn<WorkerInterface>, query: &str) -> Result<String>;
         /// Constructs an actor of `class_name` whose storage lives in `storage`. `hooks` is the
         /// actor's way back to the server; `hibernation_manager` is the evicted predecessor's,
         /// whose WebSockets the actor adopts. `container` gives the actor its container's Docker
@@ -476,11 +480,13 @@ pub mod ffi {
         /// storage), the SQLite VFS over it, and its alarm scheduler.
         type ActorStorage;
         /// `path` is the namespace's directory; empty for in-memory storage. `actors` answers
-        /// the scheduler's requests for an actor to run an alarm on.
+        /// the scheduler's requests for an actor to run an alarm on. `class_name` is recorded in
+        /// the oven registry (`_oven_NAMESPACE`).
         fn factory_new_actor_storage(
             factory: &WorkerFactory,
             path: &str,
             unique_key: &str,
+            class_name: &str,
             actors: Box<ActorNamespaceHandle>,
         ) -> Result<KjOwn<ActorStorage>>;
         /// Deletes every actor's storage and every alarm. Callers abort the actors first.

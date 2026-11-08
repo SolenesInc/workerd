@@ -93,6 +93,11 @@ fn run_compiled(
 
     let args: T = parse(T::command());
     check_serve_or_test::<T>(&args.serve_or_test);
+    if args.serve.oven_objects_dir.is_some() || args.serve.oven_env {
+        usage_error::<T>(
+            "--oven-objects-dir and --oven-env apply to a wrangler config, not a compiled binary.",
+        );
+    }
     let config = Config::from_words(embedded_config).unwrap_or_else(|error| {
         usage_error::<T>(format!("the config compiled into this executable: {error}"))
     });
@@ -123,9 +128,13 @@ fn run_command(args: args::Main, executable: Option<Executable>) -> workerd_serv
         } => {
             check_serve_or_test::<T>(&serve_or_test);
             let watcher = watcher::<T>(&serve_or_test, executable.as_ref());
+            let oven = wrangler::ServeOptions {
+                objects_dir: serve.oven_objects_dir.clone().map(Into::into),
+                env: serve.oven_env,
+            };
             let (options, inherited_sockets) = serve_options::<T>(serve, &serve_or_test);
             let process = Process::new(executable, watcher, inherited_sockets);
-            let config = load_config::<T>(config, const_name.const_name, &process);
+            let config = load_config::<T>(config, const_name.const_name, &process, &oven);
             let (config, options) = with_deployments(config, &serve_or_test, options, &process);
             entry::serve(
                 verbose,
@@ -156,7 +165,7 @@ fn run_command(args: args::Main, executable: Option<Executable>) -> workerd_serv
             check_serve_or_test::<T>(&serve_or_test);
             let watcher = watcher::<T>(&serve_or_test, executable.as_ref());
             let process = Process::new(executable, watcher, Vec::new());
-            let config = load_config::<T>(config, None, &process);
+            let config = load_config::<T>(config, None, &process, &Default::default());
             entry::test(
                 verbose,
                 config.into_words(),
@@ -176,7 +185,12 @@ fn run_command(args: args::Main, executable: Option<Executable>) -> workerd_serv
             let filter = test.filter.take().unwrap_or_default();
             let watcher = watcher::<T>(&serve_or_test, executable.as_ref());
             let process = Process::new(executable, watcher, Vec::new());
-            let config = load_config::<T>(config, filter.const_name.clone(), &process);
+            let config = load_config::<T>(
+                config,
+                filter.const_name.clone(),
+                &process,
+                &Default::default(),
+            );
             entry::test(
                 verbose,
                 config.into_words(),
@@ -257,7 +271,10 @@ fn run_deploy(
                 binary: args.binary,
                 config_file,
             };
-            (name, load_config::<T>(config, const_name, &process))
+            (
+                name,
+                load_config::<T>(config, const_name, &process, &Default::default()),
+            )
         }
         Err(error) => usage_error::<T>(error),
     };
@@ -301,7 +318,7 @@ fn run_compile(
         );
     }
     let process = Process::new(executable, None, Vec::new());
-    let config = load_config::<T>(config, const_name, &process);
+    let config = load_config::<T>(config, const_name, &process, &Default::default());
     let written = if config_only {
         config.write_to_stdout()
     } else {
@@ -324,7 +341,12 @@ fn run_bench(
     let filter = bench.filter.take().unwrap_or_default();
     let watcher = watcher::<T>(serve_or_test, executable.as_ref());
     let process = Process::new(executable, watcher, Vec::new());
-    let config = load_config::<T>(config, filter.test.const_name.clone(), &process);
+    let config = load_config::<T>(
+        config,
+        filter.test.const_name.clone(),
+        &process,
+        &Default::default(),
+    );
     entry::bench(
         verbose,
         config.into_words(),
@@ -408,6 +430,7 @@ fn load_config<T: CommandFactory>(
     config: args::ConfigFileArgs,
     const_name: Option<String>,
     process: &Process,
+    oven: &wrangler::ServeOptions,
 ) -> Config {
     let args::ConfigFileArgs {
         import_paths,
@@ -443,10 +466,15 @@ fn load_config<T: CommandFactory>(
         if !std::path::Path::new(&config_file).is_file() {
             usage_error::<T>(format!("{config_file}: No such file."));
         }
-        return wrangler::load(&config_file, process)
+        return wrangler::load(&config_file, process, oven)
             .unwrap_or_else(|error| config_errors(&[format!("{config_file}: {error}")], process));
     }
 
+    if oven.objects_dir.is_some() || oven.env {
+        usage_error::<T>(format!(
+            "{config_file}: --oven-objects-dir and --oven-env apply to a wrangler config only."
+        ));
+    }
     let compiled = ffi::compile_config(
         &config_file,
         &import_paths,
@@ -601,6 +629,7 @@ fn serve_options<T: CommandFactory>(
         socket_fds,
         control,
         debug_port: serve.debug_port,
+        oven_admin: serve.oven_admin_addr,
         cluster_address: serve.cluster_address,
         cluster_advertise: serve.cluster_advertise,
         ..run_options(serve_or_test)

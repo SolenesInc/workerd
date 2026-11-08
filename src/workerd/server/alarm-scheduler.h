@@ -82,6 +82,16 @@ class AlarmScheduler final: kj::TaskSet::ErrorHandler {
   // Cancels all pending alarms and removes them from persistent storage.
   void deleteAll();
 
+  // Oven's registry: the objects of the namespace, in `_oven_OBJECT`. Records `actor` when its
+  // storage is opened: its name, if it has one and none is recorded yet, and the time it was
+  // first recorded, in Unix milliseconds. Each alarm run records its time, whether it succeeded
+  // and how many retries preceded it.
+  void registerObject(const ActorKey& actor);
+
+  // Records the namespace's class name in `_oven_NAMESPACE`, its only row. The directory is named
+  // by the class's storage key, which a rename keeps, so this is how a reader learns the class.
+  void setClassName(kj::StringPtr className);
+
  private:
   enum class AlarmStatus { WAITING, STARTED, FINISHED };
   const kj::Clock& clock;
@@ -134,6 +144,17 @@ class AlarmScheduler final: kj::TaskSet::ErrorHandler {
   SqliteDatabase::Statement stmtDeleteAlarm = db->prepare(R"(
     DELETE FROM _cf_ALARM WHERE actor_id = ?
   )");
+
+  SqliteDatabase::Statement stmtRegisterObject = db->prepare(R"(
+    INSERT INTO _oven_OBJECT (actor_id, name, created_at) VALUES(?, ?, ?)
+      ON CONFLICT DO UPDATE SET name = COALESCE(_oven_OBJECT.name, excluded.name);
+  )");
+  SqliteDatabase::Statement stmtRecordAlarm = db->prepare(R"(
+    UPDATE _oven_OBJECT SET last_alarm_at = ?, last_alarm_ok = ?, last_alarm_retries = ?
+      WHERE actor_id = ?
+  )");
+
+  void recordAlarm(const ActorKey& actor, bool ok, uint32_t retries);
 
   void taskFailed(kj::Exception&& exception) override;
 

@@ -682,6 +682,38 @@ pub async fn listen_debug_port(context: Rc<ListenContext>, listener: StreamListe
     }
 }
 
+/// Serves oven's admin socket (`crate::oven_admin`) on `listener` until the server drains.
+pub async fn listen_oven_admin(
+    context: Rc<ListenContext>,
+    listener: StreamListener,
+    server: Rc<crate::config::Server>,
+) -> Result<()> {
+    let settings = Rc::new(ServerSettings::default());
+    let shutdown = Rc::new(Shutdown::new());
+    let serve = |accepted: Accepted| {
+        let context = Rc::clone(&context);
+        let settings = Rc::clone(&settings);
+        let shutdown = Rc::clone(&shutdown);
+        let server = Rc::clone(&server);
+        async move {
+            let hangup = hangup(&accepted);
+            let io = transport(accepted, None, &context).await?;
+            let handler: Rc<dyn Handler> = Rc::new(crate::oven_admin::AdminConnection { server });
+            let table = header_table(&context.factory);
+            kj_hyper::server::serve_connection(io, hangup, table, settings, handler, &shutdown)
+                .await
+        }
+    };
+    let what = "oven admin connection failed";
+    accept_loop(
+        &context,
+        what,
+        || listener.accept().map_ok(&serve),
+        || shutdown.shutdown(),
+    )
+    .await
+}
+
 #[cfg(test)]
 #[path = "mod-test.rs"]
 mod tests;

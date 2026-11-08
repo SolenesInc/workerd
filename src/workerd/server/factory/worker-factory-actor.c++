@@ -5,6 +5,7 @@
 #include "worker-factory-impl.h"
 
 #include <workerd/api/actor-state.h>
+#include <workerd/api/sql.h>
 #include <workerd/io/actor-cache.h>
 #include <workerd/io/io-context.h>
 #include <workerd/server/actor-id-impl.h>
@@ -168,9 +169,8 @@ ActorStorage::Impl::Impl(const WorkerFactory& factory,
     : actors(kj::mv(actorsParam)),
       directory(kj::mv(directoryParam)),
       vfsDirectory(directory.map([](kj::Own<const kj::Directory>& d) { return d->clone(); })
-                       .orDefault([&]() {
-                         return kj::newInMemoryDirectory(kj::systemPreciseCalendarClock());
-                       })),
+              .orDefault(
+                  [&]() { return kj::newInMemoryDirectory(kj::systemPreciseCalendarClock()); })),
       sqliteDirectory(actors->replicated()
               ? kj::heap<ClusterDirectory>(vfsDirectory->clone(), *actors)
               : vfsDirectory->clone()),
@@ -268,6 +268,7 @@ ActorStorage::Impl& ActorStorage::getImpl() const {
 kj::Own<ActorStorage> factory_new_actor_storage(const WorkerFactory& factory,
     ::rust::Str path,
     ::rust::Str uniqueKey,
+    ::rust::Str className,
     ::rust::Box<ActorNamespaceHandle> actors) {
   kj::Maybe<kj::Own<const kj::Directory>> directory;
   if (!path.empty()) {
@@ -277,8 +278,10 @@ kj::Own<ActorStorage> factory_new_actor_storage(const WorkerFactory& factory,
     directory = base->openSubdir(
         kj::Path({kj::str(uniqueKey)}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
   }
-  return kj::heap<ActorStorage>(kj::refcounted<ActorStorage::Impl>(
-      factory, kj::mv(directory), kj::str(uniqueKey), kj::mv(actors)));
+  auto impl = kj::refcounted<ActorStorage::Impl>(
+      factory, kj::mv(directory), kj::str(uniqueKey), kj::mv(actors));
+  impl->alarmScheduler->setClassName(kj::str(className));
+  return kj::heap<ActorStorage>(kj::mv(impl));
 }
 
 void actor_storage_set_alarm(
@@ -535,8 +538,9 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
     kj::Maybe<ActorSqliteHooks&> rootHooks;
     uint selfId = facetId.orDefault(0);
     if (facetId == kj::none) {
-      auto root =
-          kj::heap<ActorSqliteHooks>(kj::addRef(*storage), ActorKey(rootKey.asPtr(), actorName));
+      auto key = ActorKey(rootKey.asPtr(), actorName);
+      storage->alarmScheduler->registerObject(key);
+      auto root = kj::heap<ActorSqliteHooks>(kj::addRef(*storage), kj::mv(key));
       rootHooks = *root;
       sqliteHooks = kj::mv(root);
     } else {
@@ -804,6 +808,72 @@ kj::Promise<void> factory_shutdown_containers(const WorkerFactory& factory) {
     cleanups.add(entry.value->cleanup.addBranch());
   }
   return kj::joinPromises(cleanups.releaseAsArray());
+}
+
+namespace {
+
+// Oven's admin socket's statement, run as an event of the object: on its own connection and in
+// its own turn, as `ctx.storage.sql.exec()` runs it, so the object sees the write and nothing but
+// the object's process writes its file. It runs no application code.
+class OvenSqlEvent final: public WorkerInterface::CustomEvent, public kj::Refcounted {
+ public:
+  explicit OvenSqlEvent(kj::String query): query(kj::mv(query)) {}
+
+  // The rows, as a JSON array, once `run()` succeeds.
+  kj::Maybe<kj::String> rows;
+
+  kj::Promise<Result> run(kj::Own<IoContext_IncomingRequest> incomingRequest,
+      kj::Maybe<kj::StringPtr> entrypointName,
+      kj::Maybe<Worker::VersionInfo> versionInfo,
+      Frankenvalue props,
+      kj::TaskSet& waitUntilTasks,
+      bool isDynamicDispatch) override {
+    auto& context = incomingRequest->getContext();
+    incomingRequest->delivered("oven_sql"_kj);
+    KJ_DEFER({ incomingRequest->drain(waitUntilTasks, kj::mv(incomingRequest)); });
+    co_await context.run([this](Worker::Lock& lock, IoContext& context) {
+      jsg::Lock& js = lock;
+      auto& actor = KJ_REQUIRE_NONNULL(context.getActor());
+      auto storage = JSG_REQUIRE_NONNULL(
+          actor.makeStorageForSwSyntax(lock), Error, "This Durable Object has no storage.");
+      auto cursor = storage->getSql(js)->exec(js, js.str(query),
+          jsg::Arguments<api::SqlStorage::BindingValue>(
+              kj::Array<api::SqlStorage::BindingValue>()));
+      rows = jsg::JsValue(cursor->toArray(js)).toJson(js);
+    });
+    // The write is acknowledged once it is durable, as an application's is.
+    co_await context.waitForOutputLocks();
+    co_return Result{.outcome = EventOutcome::OK};
+  }
+
+  kj::Promise<Result> sendRpc(capnp::HttpOverCapnpFactory&,
+      capnp::ByteStreamFactory&,
+      FrankenvalueHandler&,
+      rpc::EventDispatcher::Client) override {
+    KJ_UNIMPLEMENTED("the oven admin socket's statement runs only in this process");
+  }
+  kj::Promise<Result> notSupported() override {
+    KJ_UNIMPLEMENTED("the oven admin socket's statement runs only on a Durable Object");
+  }
+  uint16_t getType() override {
+    // Outside the event types workerd and its RPC protocol define.
+    return 0x4f56;
+  }
+  tracing::EventInfo getEventInfo() const override {
+    return tracing::CustomEventInfo();
+  }
+
+ private:
+  kj::String query;
+};
+
+}  // namespace
+
+kj::Promise<::rust::String> actor_oven_sql(kj::Own<WorkerInterface> worker, ::rust::Str query) {
+  auto event = kj::refcounted<OvenSqlEvent>(kj::str(query));
+  co_await worker->customEvent(kj::addRef(*event));
+  auto& rows = KJ_REQUIRE_NONNULL(event->rows, "the statement did not run");
+  co_return toRustString(rows);
 }
 
 }  // namespace workerd::server

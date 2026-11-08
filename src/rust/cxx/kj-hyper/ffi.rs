@@ -51,6 +51,7 @@ use crate::body::RustBody;
 use crate::handshake;
 use crate::io::RustIo;
 use crate::server::ConnectResponder;
+use crate::server::Draining;
 use crate::server::ServerResponse;
 use crate::starttls::TlsStarter;
 
@@ -265,6 +266,11 @@ mod bridge {
             headers: &HttpHeaders,
             extensions: &[u8],
         ) -> Result<Box<RustIo>>;
+        /// The drain signal of the response's connection, for the WebSocket it accepts.
+        fn draining(self: &ServerResponse) -> Box<Draining>;
+
+        type Draining;
+        async fn wait(self: &Draining);
 
         type TlsStarter;
         async fn start(self: &TlsStarter, expected_server_hostname: &[u8]) -> Result<()>;

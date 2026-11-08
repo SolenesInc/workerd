@@ -32,6 +32,7 @@ fn load_project(files: &[(&str, &str)]) -> Result<Config, String> {
     load(
         dir.join("wrangler.jsonc").to_str().unwrap(),
         &Process::new(None, None, Vec::new()),
+        &ServeOptions::default(),
     )
 }
 
@@ -478,4 +479,94 @@ fn failed_bundle_watches_sources_and_missing_main() {
         *watched.borrow(),
         [dir.join("index.ts"), dir.join("lib.ts")]
     );
+}
+
+#[test]
+fn oven_objects_dir_and_env() {
+    // A name no other test or the environment uses.
+    // SAFETY: no other test reads or writes this variable.
+    unsafe {
+        std::env::set_var("OVEN_WRANGLER_TEST_VAR", "from-env");
+        std::env::set_var("OVEN_WRANGLER_TEST_OVERRIDDEN", "from-env");
+    }
+    let dir = project(&[
+        (
+            "wrangler.jsonc",
+            r#"{
+              "name": "counter",
+              "main": "index.js",
+              "compatibility_date": "2026-01-01",
+              "no_bundle": true,
+              "vars": { "OVEN_WRANGLER_TEST_OVERRIDDEN": "from-vars", "ONLY_VARS": 1 },
+              "durable_objects": {
+                "bindings": [{ "name": "COUNTER", "class_name": "Counter" }],
+              },
+              "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Counter"] }],
+            }"#,
+        ),
+        ("index.js", "export class Counter {}"),
+    ]);
+    let objects = dir.join("objects");
+    let options = ServeOptions {
+        objects_dir: Some(objects.clone()),
+        env: true,
+    };
+    let config = load(
+        dir.join("wrangler.jsonc").to_str().unwrap(),
+        &Process::new(None, None, Vec::new()),
+        &options,
+    )
+    .unwrap();
+    let message = read(config);
+    let config = message.get_root::<config::Reader>().unwrap();
+    let services = config.get_services().unwrap();
+    let service::Which::Worker(worker) = services.get(0).which().unwrap() else {
+        panic!("expected a worker service")
+    };
+    let worker = worker.unwrap();
+
+    let text = |name: &str| {
+        let bindings = worker.get_bindings().unwrap();
+        let b = bindings
+            .iter()
+            .find(|b| b.get_name().unwrap() == name)
+            .unwrap_or_else(|| panic!("no binding {name}"));
+        match b.which().unwrap() {
+            worker::binding::Which::Text(t) => t.unwrap().to_string().unwrap(),
+            worker::binding::Which::Json(j) => format!("json:{}", j.unwrap().to_str().unwrap()),
+            _ => panic!("{name} is not text"),
+        }
+    };
+    assert_eq!(text("OVEN_WRANGLER_TEST_VAR"), "from-env");
+    assert_eq!(text("OVEN_WRANGLER_TEST_OVERRIDDEN"), "from-env");
+    assert_eq!(text("ONLY_VARS"), "json:1");
+    assert_eq!(text("PATH"), std::env::var("PATH").unwrap());
+
+    // The class's directory is named by its storage key alone.
+    let ns = worker.get_durable_object_namespaces().unwrap().get(0);
+    let worker::durable_object_namespace::Which::UniqueKey(key) = ns.which().unwrap() else {
+        panic!("expected a unique key")
+    };
+    assert_eq!(key.unwrap(), "Counter");
+    let service::Which::Disk(disk) = services.get(1).which().unwrap() else {
+        panic!("expected a disk service")
+    };
+    assert_eq!(
+        disk.unwrap().get_path().unwrap().to_str().unwrap(),
+        objects.to_str().unwrap()
+    );
+    assert!(objects.is_dir());
+
+    // An environment variable cannot hide a Durable Object binding.
+    // SAFETY: as above.
+    unsafe { std::env::set_var("COUNTER", "x") };
+    let error = load(
+        dir.join("wrangler.jsonc").to_str().unwrap(),
+        &Process::new(None, None, Vec::new()),
+        &options,
+    )
+    .err()
+    .unwrap();
+    unsafe { std::env::remove_var("COUNTER") };
+    assert!(error.contains("COUNTER"), "{error}");
 }

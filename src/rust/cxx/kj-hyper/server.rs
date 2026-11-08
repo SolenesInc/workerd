@@ -696,6 +696,31 @@ impl ServerResponse {
     }
 }
 
+/// The drain signal of the connection a WebSocket was accepted on: resolves once the server
+/// drains ([`Shutdown`]), and never for a connection served without one. The accepted WebSocket
+/// closes itself with 1012 (service restart) on it, since a WebSocket outlives any response and
+/// would otherwise hold the drain open for as long as its client keeps it.
+pub struct Draining(Option<watch::Receiver<bool>>);
+
+impl Draining {
+    pub fn wait(&self) -> impl Future<Output = ()> + use<> {
+        let draining = self.0.clone();
+        async move {
+            match draining {
+                Some(mut draining) => drop(draining.wait_for(|draining| *draining).await),
+                None => pending().await,
+            }
+        }
+    }
+}
+
+impl ServerResponse {
+    /// The drain signal for the WebSocket `accept_websocket()` hands over.
+    pub fn draining(&self) -> Box<Draining> {
+        Box::new(Draining(self.0.draining.clone()))
+    }
+}
+
 /// A CONNECT request's answer.
 ///
 /// Accept it and take the tunnel in Rust, reject it, or hand both to a C++
