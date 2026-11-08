@@ -45,13 +45,27 @@ jobs:
         run: node oven/test.mjs out/workerd
       - name: Runs on Debian bookworm
         run: docker run --rm -v "$PWD/out:/out:ro" node:22-bookworm /out/workerd --version
+      - name: Build the image and run it as oven does
+        run: |
+          cp oven/Dockerfile out/Dockerfile
+          docker build --platform linux/amd64 -t "ghcr.io/solenesinc/oven-workerd:$GITHUB_REF_NAME" out
+          # An app image as oven builds one: the fork's image plus the worker, run as uid 1000
+          # with a read-only root, writable /tmp and /data.
+          mkdir app && cp oven/fixture/* app/
+          printf 'FROM ghcr.io/solenesinc/oven-workerd:%s\nCOPY . /app/\n' "$GITHUB_REF_NAME" > app/Dockerfile
+          docker build -t oven-app app
+          docker run -d --name app --read-only --tmpfs /tmp --tmpfs /data:uid=1000,gid=1000 \
+            -u 1000:1000 -e OVEN_SMOKE=yes -p 127.0.0.1:8080:8080 oven-app serve /app/wrangler.json \
+            --oven-objects-dir /data/objects --oven-env --oven-admin-addr 0.0.0.0:8091 \
+            --socket-addr http=0.0.0.0:8080
+          for i in $(seq 1 50); do curl -sf 127.0.0.1:8080/env > env.json && break; sleep 0.2; done
+          docker logs app
+          grep -q '"OVEN_SMOKE":"yes"' env.json
       - name: Publish the image
         if: startsWith(github.ref, 'refs/tags/')
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
           image=ghcr.io/solenesinc/oven-workerd
-          cp oven/Dockerfile out/Dockerfile
-          docker build --platform linux/amd64 -t "$image:$GITHUB_REF_NAME" out
           docker push "$image:$GITHUB_REF_NAME"
           digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$image:$GITHUB_REF_NAME")
           echo "Published $digest" | tee -a "$GITHUB_STEP_SUMMARY"
