@@ -1,0 +1,9 @@
+{
+  "name": "fixture",
+  "main": "worker.js",
+  "compatibility_date": "2026-11-01",
+  "no_bundle": true,
+  "vars": {"FROM_VARS": "vars-value", "OVERRIDDEN": "from-vars"},
+  "durable_objects": {"bindings": [{"name": "ROOM", "class_name": "Room"}]},
+  "migrations": [{"tag": "v1", "new_sqlite_classes": ["Room"]}]
+}

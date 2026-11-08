@@ -1,0 +1,53 @@
+# Builds the oven fork's release binary on a free runner, runs its acceptance test, and publishes
+# ghcr.io/solenesinc/oven-workerd. Runs on a release tag (v<npm version>-oven.<n>) or by hand.
+name: oven release
+
+on:
+  push:
+    tags: ["v*-oven.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Make room for the Bazel cache
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: ~/bazel-disk-cache
+          key: oven-bazel-${{ hashFiles('MODULE.bazel.lock', '.bazelversion') }}-${{ github.sha }}
+          restore-keys: oven-bazel-${{ hashFiles('MODULE.bazel.lock', '.bazelversion') }}-
+      - name: Build
+        run: |
+          start=$(date +%s)
+          bazel build --disk_cache=~/bazel-disk-cache --config=release_linux //src/workerd/server:workerd
+          echo "build took $(( $(date +%s) - start )) s"
+          du -sh ~/bazel-disk-cache "$(bazel info output_base)"
+          mkdir -p out && cp bazel-bin/src/workerd/server/workerd out/workerd
+          ls -l out/workerd
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Acceptance test
+        run: node oven/test.mjs out/workerd
+      - name: Runs on Debian bookworm
+        run: docker run --rm -v "$PWD/out:/out:ro" node:22-bookworm /out/workerd --version
+      - name: Publish the image
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          image=ghcr.io/solenesinc/oven-workerd
+          cp oven/Dockerfile out/Dockerfile
+          docker build --platform linux/amd64 -t "$image:$GITHUB_REF_NAME" out
+          docker push "$image:$GITHUB_REF_NAME"
+          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$image:$GITHUB_REF_NAME")
+          echo "Published $digest" | tee -a "$GITHUB_STEP_SUMMARY"
