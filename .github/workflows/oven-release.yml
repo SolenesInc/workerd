@@ -32,6 +32,8 @@ jobs:
           restore-keys: oven-bazel-${{ hashFiles('MODULE.bazel.lock', '.bazelversion') }}-
       - name: Build
         run: |
+          # The SDK was removed above; rules_android would look for it there.
+          unset ANDROID_HOME ANDROID_SDK_ROOT ANDROID_NDK ANDROID_NDK_HOME ANDROID_NDK_ROOT ANDROID_NDK_LATEST_HOME
           start=$(date +%s)
           bazel build --disk_cache=~/bazel-disk-cache --config=release_linux //src/workerd/server:workerd
           echo "build took $(( $(date +%s) - start )) s"
